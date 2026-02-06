@@ -1,63 +1,212 @@
 package main
 
 import (
+	"encoding/binary"
 	"fmt"
 	"math"
 	"os"
 	"strings"
 	"syscall"
 	"time"
+	"unsafe"
 
 	evdev "github.com/gvalkov/golang-evdev"
 )
 
-// --- CONFIGURATION ---
 const (
-	DeviceNameKeyword = "GXTP"
+	DeviceNameKeyword     = "GXTP"
+	DeviceNameMustContain = "Touchpad"
 
-	// Movement & Physics
 	MoveSensitivity  = 0.6
 	AccelFactor      = 1.5
-	ScrollDivider    = 40
+	ScrollDivider    = 40.0
 	NaturalScrolling = true
 
-	// Palm Rejection
 	PalmZoneTopY          = 500
 	PalmPressureThreshold = 45
 
-	// Noise / Filtering
 	MinMovePressure      = 2
 	LowPressureThreshold = 15
-	SmallMoveCutoff      = 2
+	SmallMoveCutoff      = 2.0
 
-	// Tapping & Clicking
 	TapTimeout          = 200 * time.Millisecond
 	TapMovementLimit    = 40.0
 	PressThreshold      = 140
 	ReleaseThreshold    = 80
 	CooldownAfterScroll = 250 * time.Millisecond
 
-	// 3-Finger Gestures
-	GestureDistThreshold = 100
+	GestureDistThreshold = 100.0
 
-	// Zones
 	RightClickZoneX = 3000
 	BottomZoneY     = 1800
 )
 
-// Slot represents the state of a single finger
+const (
+	EV_SYN = 0x00
+	EV_KEY = 0x01
+	EV_REL = 0x02
+
+	SYN_REPORT = 0x00
+
+	REL_X      = 0x00
+	REL_Y      = 0x01
+	REL_HWHEEL = 0x06
+	REL_WHEEL  = 0x08
+
+	BTN_LEFT   = 0x110
+	BTN_RIGHT  = 0x111
+	BTN_MIDDLE = 0x112
+
+	KEY_LEFTMETA  = 125
+	KEY_LEFTALT   = 56
+	KEY_LEFTSHIFT = 42
+	KEY_TAB       = 15
+	KEY_D         = 32
+
+	UINPUT_MAX_NAME_SIZE = 80
+
+	UI_SET_EVBIT  = 0x40045564
+	UI_SET_KEYBIT = 0x40045565
+	UI_SET_RELBIT = 0x40045566
+	UI_DEV_CREATE = 0x5501
+)
+
+type inputEvent struct {
+	Time  syscall.Timeval
+	Type  uint16
+	Code  uint16
+	Value int32
+}
+
+type uinputUserDev struct {
+	Name       [UINPUT_MAX_NAME_SIZE]byte
+	ID         inputID
+	EffectsMax uint32
+	Absmax     [64]int32
+	Absmin     [64]int32
+	Absfuzz    [64]int32
+	Absflat    [64]int32
+}
+
+type inputID struct {
+	Bustype uint16
+	Vendor  uint16
+	Product uint16
+	Version uint16
+}
+
 type Slot struct {
 	X, Y, P int32
 }
 
+type VirtualDevice struct {
+	fd *os.File
+}
+
+func ioctl(fd uintptr, request uintptr, val uintptr) error {
+	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, fd, request, val)
+	if errno != 0 {
+		return errno
+	}
+	return nil
+}
+
+func ioctlInt(fd uintptr, request uintptr, val int) error {
+	return ioctl(fd, request, uintptr(val))
+}
+
+func createVirtualDevice(name string) (*VirtualDevice, error) {
+	f, err := os.OpenFile("/dev/uinput", os.O_WRONLY|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		return nil, fmt.Errorf("open /dev/uinput: %w", err)
+	}
+
+	fd := f.Fd()
+
+	for _, ev := range []int{EV_KEY, EV_REL, EV_SYN} {
+		if err := ioctlInt(fd, UI_SET_EVBIT, ev); err != nil {
+			f.Close()
+			return nil, fmt.Errorf("set evbit %d: %w", ev, err)
+		}
+	}
+
+	for _, rel := range []int{REL_X, REL_Y, REL_WHEEL, REL_HWHEEL} {
+		if err := ioctlInt(fd, UI_SET_RELBIT, rel); err != nil {
+			f.Close()
+			return nil, fmt.Errorf("set relbit %d: %w", rel, err)
+		}
+	}
+
+	for _, key := range []int{BTN_LEFT, BTN_RIGHT, BTN_MIDDLE, KEY_LEFTMETA, KEY_TAB, KEY_LEFTALT, KEY_LEFTSHIFT, KEY_D} {
+		if err := ioctlInt(fd, UI_SET_KEYBIT, key); err != nil {
+			f.Close()
+			return nil, fmt.Errorf("set keybit %d: %w", key, err)
+		}
+	}
+
+	var dev uinputUserDev
+	copy(dev.Name[:], name)
+	dev.ID.Bustype = 0x03
+	dev.ID.Vendor = 0x1234
+	dev.ID.Product = 0x5678
+	dev.ID.Version = 1
+
+	buf := (*[4096]byte)(unsafe.Pointer(&dev))[:unsafe.Sizeof(dev)]
+	if _, err := f.Write(buf); err != nil {
+		f.Close()
+		return nil, fmt.Errorf("write dev info: %w", err)
+	}
+
+	if err := ioctl(fd, UI_DEV_CREATE, 0); err != nil {
+		f.Close()
+		return nil, fmt.Errorf("dev create: %w", err)
+	}
+
+	time.Sleep(200 * time.Millisecond)
+	return &VirtualDevice{fd: f}, nil
+}
+
+func (v *VirtualDevice) writeEvent(typ uint16, code uint16, value int32) {
+	var tv syscall.Timeval
+	syscall.Gettimeofday(&tv)
+	binary.Write(v.fd, binary.LittleEndian, inputEvent{Time: tv, Type: typ, Code: code, Value: value})
+}
+
+func (v *VirtualDevice) syn() {
+	v.writeEvent(EV_SYN, SYN_REPORT, 0)
+}
+
+func (v *VirtualDevice) Close() {
+	v.fd.Close()
+}
+
+func findDevice(keyword, mustContain string) (string, error) {
+	devices, _ := evdev.ListInputDevices()
+	var fallback string
+	for _, dev := range devices {
+		nameLower := strings.ToLower(dev.Name)
+		if strings.Contains(nameLower, strings.ToLower(keyword)) {
+			if strings.Contains(nameLower, strings.ToLower(mustContain)) {
+				return dev.Fn, nil
+			}
+			if fallback == "" {
+				fallback = dev.Fn
+			}
+		}
+	}
+	if fallback != "" {
+		return fallback, nil
+	}
+	return "", fmt.Errorf("device with keyword '%s' not found", keyword)
+}
+
 func main() {
-	// 1. Find Device
-	devicePath, err := findDevice(DeviceNameKeyword)
+	devicePath, err := findDevice(DeviceNameKeyword, DeviceNameMustContain)
 	if err != nil {
 		fmt.Printf("Error: %v\n", err)
 		os.Exit(1)
 	}
-	fmt.Printf("Found device at %s\n", devicePath)
+	fmt.Printf("Found touchpad at %s\n", devicePath)
 
 	dev, err := evdev.Open(devicePath)
 	if err != nil {
@@ -67,16 +216,13 @@ func main() {
 	dev.Grab()
 	defer dev.Release()
 
-	// 2. Create Virtual UInput Device
-	vMouse, err := createUinput()
+	vmouse, err := createVirtualDevice("Goodix-Driver")
 	if err != nil {
-		fmt.Printf("Error creating uinput: %v\n", err)
-		fmt.Println("Try running with sudo or check /dev/uinput permissions.")
+		fmt.Printf("Error creating virtual device: %v\n", err)
 		os.Exit(1)
 	}
-	defer vMouse.Close()
+	defer vmouse.Close()
 
-	// 3. State Variables
 	slots := make(map[int]*Slot)
 	prevSlots := make(map[int]*Slot)
 	activeSlot := 0
@@ -86,50 +232,40 @@ func main() {
 		maxFingersDuringTouch  int
 		maxPressureDuringTouch int32
 		touchStartTime         time.Time
-		touchStartCoords       Slot
+		touchStartX, touchStartY int32
 		isPhysicallyClicked    bool
 		activePhysicalButton   uint16
 		lastScrollTime         time.Time
 		scrollAccX, scrollAccY float64
 		isScrolling            bool
-
-		// Logic Flags
-		isPalmRejected   bool
-		gestureAccX      float64
-		gestureAccY      float64
-		gestureTriggered bool
+		isPalmRejected         bool
+		gestureAccX, gestureAccY float64
+		gestureTriggered       bool
 	)
 
-	fmt.Println("Driver started. Press Ctrl+C to stop.")
+	fmt.Println("Driver started.")
 
-	// 4. Event Loop
 	for {
 		events, err := dev.Read()
 		if err != nil {
-			fmt.Println("Error reading events:", err)
 			break
 		}
 
 		for _, event := range events {
 			switch event.Type {
 			case evdev.EV_ABS:
-				switch event.Code {
-				case evdev.ABS_MT_SLOT:
+				if event.Code == evdev.ABS_MT_SLOT {
 					activeSlot = int(event.Value)
+				}
+				if _, ok := slots[activeSlot]; !ok {
+					slots[activeSlot] = &Slot{}
+				}
+				switch event.Code {
 				case evdev.ABS_MT_POSITION_X:
-					if _, ok := slots[activeSlot]; !ok {
-						slots[activeSlot] = &Slot{}
-					}
 					slots[activeSlot].X = event.Value
 				case evdev.ABS_MT_POSITION_Y:
-					if _, ok := slots[activeSlot]; !ok {
-						slots[activeSlot] = &Slot{}
-					}
 					slots[activeSlot].Y = event.Value
 				case evdev.ABS_MT_PRESSURE:
-					if _, ok := slots[activeSlot]; !ok {
-						slots[activeSlot] = &Slot{}
-					}
 					slots[activeSlot].P = event.Value
 					if event.Value > maxPressureDuringTouch {
 						maxPressureDuringTouch = event.Value
@@ -143,85 +279,58 @@ func main() {
 			case evdev.EV_KEY:
 				switch event.Code {
 				case evdev.BTN_TOOL_FINGER:
-					if event.Value == 1 {
-						currentFingerCount = 1
-					} else {
-						currentFingerCount = 0
-					}
+					if event.Value == 1 { currentFingerCount = 1 } else { currentFingerCount = 0 }
 				case evdev.BTN_TOOL_DOUBLETAP:
-					if event.Value == 1 {
-						currentFingerCount = 2
-					} else {
-						currentFingerCount = 0
-					}
+					if event.Value == 1 { currentFingerCount = 2 } else { currentFingerCount = 0 }
 				case evdev.BTN_TOOL_TRIPLETAP:
-					if event.Value == 1 {
-						currentFingerCount = 3
-					} else {
-						currentFingerCount = 0
-					}
+					if event.Value == 1 { currentFingerCount = 3 } else { currentFingerCount = 0 }
 				}
-
 				if currentFingerCount > maxFingersDuringTouch {
 					maxFingersDuringTouch = currentFingerCount
 				}
 
 				if event.Code == evdev.BTN_TOUCH {
 					now := time.Now()
-					if event.Value == 1 { // Touch Down
+					if event.Value == 1 {
 						touchStartTime = now
 						maxFingersDuringTouch = currentFingerCount
 						maxPressureDuringTouch = 0
 						isScrolling = false
 						gestureTriggered = false
 						gestureAccX, gestureAccY = 0, 0
-
 						if s, ok := slots[0]; ok {
-							touchStartCoords = *s
-							// --- PALM REJECTION ---
-							if s.Y < PalmZoneTopY && s.P > PalmPressureThreshold {
-								isPalmRejected = true
-							} else {
-								isPalmRejected = false
-							}
+							touchStartX, touchStartY = s.X, s.Y
+							isPalmRejected = s.Y < PalmZoneTopY && s.P > PalmPressureThreshold
 						}
-						// Clear previous slots history on new touch
 						prevSlots = make(map[int]*Slot)
-
-					} else { // Touch Up
+					} else {
 						duration := now.Sub(touchStartTime)
 						timeSinceScroll := now.Sub(lastScrollTime)
-						wasPhysicalClick := maxPressureDuringTouch > int32(PressThreshold)
+						wasPhysicalClick := maxPressureDuringTouch > PressThreshold
 
-						if !isPalmRejected {
-							// Tap to Click Logic
-							if duration < TapTimeout && !wasPhysicalClick &&
-								timeSinceScroll > CooldownAfterScroll && !gestureTriggered {
+						if !isPalmRejected && duration < TapTimeout && !wasPhysicalClick &&
+							timeSinceScroll > CooldownAfterScroll && !gestureTriggered {
 
-								lastX, lastY := touchStartCoords.X, touchStartCoords.Y
-								if ps, ok := prevSlots[0]; ok {
-									lastX, lastY = ps.X, ps.Y
+							lastX, lastY := touchStartX, touchStartY
+							if ps, ok := prevSlots[0]; ok {
+								lastX, lastY = ps.X, ps.Y
+							}
+							dist := math.Sqrt(math.Pow(float64(lastX-touchStartX), 2) + math.Pow(float64(lastY-touchStartY), 2))
+
+							if dist < TapMovementLimit {
+								clickBtn := uint16(BTN_LEFT)
+								if maxFingersDuringTouch == 2 {
+									clickBtn = BTN_RIGHT
+								} else if maxFingersDuringTouch == 3 {
+									clickBtn = BTN_MIDDLE
+								} else if lastX > RightClickZoneX && lastY > BottomZoneY {
+									clickBtn = BTN_RIGHT
 								}
-
-								dist := math.Sqrt(math.Pow(float64(lastX-touchStartCoords.X), 2) +
-									math.Pow(float64(lastY-touchStartCoords.Y), 2))
-
-								if dist < TapMovementLimit {
-									clickBtn := uint16(evdev.BTN_LEFT)
-									if maxFingersDuringTouch == 2 {
-										clickBtn = evdev.BTN_RIGHT
-									} else if maxFingersDuringTouch == 3 {
-										clickBtn = evdev.BTN_MIDDLE
-									} else if lastX > RightClickZoneX && lastY > BottomZoneY {
-										clickBtn = evdev.BTN_RIGHT
-									}
-
-									sendKey(vMouse, clickBtn, 1)
-									vMouse.Sync()
-									time.Sleep(15 * time.Millisecond)
-									sendKey(vMouse, clickBtn, 0)
-									vMouse.Sync()
-								}
+								vmouse.writeEvent(EV_KEY, clickBtn, 1)
+								vmouse.syn()
+								time.Sleep(15 * time.Millisecond)
+								vmouse.writeEvent(EV_KEY, clickBtn, 0)
+								vmouse.syn()
 							}
 						}
 					}
@@ -230,7 +339,10 @@ func main() {
 			case evdev.EV_SYN:
 				if event.Code == evdev.SYN_REPORT {
 					if isPalmRejected {
-						continue // Ignore everything if palm detected
+						for k, v := range slots {
+							prevSlots[k] = &Slot{X: v.X, Y: v.Y, P: v.P}
+						}
+						continue
 					}
 
 					pressure := int32(0)
@@ -238,27 +350,21 @@ func main() {
 						pressure = s.P
 					}
 
-					// Physical Click Handling
-					if !isPhysicallyClicked && pressure > int32(PressThreshold) {
+					if !isPhysicallyClicked && pressure > PressThreshold {
 						isPhysicallyClicked = true
-						isRight := false
-						if s, ok := slots[0]; ok {
-							if s.X > RightClickZoneX && s.Y > BottomZoneY {
-								isRight = true
-							}
+						activePhysicalButton = BTN_LEFT
+						if s, ok := slots[0]; ok && s.X > RightClickZoneX && s.Y > BottomZoneY {
+							activePhysicalButton = BTN_RIGHT
 						}
-						activePhysicalButton = evdev.BTN_LEFT
-						if isRight {
-							activePhysicalButton = evdev.BTN_RIGHT
-						}
-						sendKey(vMouse, activePhysicalButton, 1)
-
-					} else if isPhysicallyClicked && pressure < int32(ReleaseThreshold) {
+						vmouse.writeEvent(EV_KEY, activePhysicalButton, 1)
+						vmouse.syn()
+					} else if isPhysicallyClicked && pressure < ReleaseThreshold {
 						isPhysicallyClicked = false
-						sendKey(vMouse, activePhysicalButton, 0)
+						vmouse.writeEvent(EV_KEY, activePhysicalButton, 0)
+						vmouse.syn()
+						activePhysicalButton = 0
 					}
 
-					// Movement & Gestures
 					s0, hasS0 := slots[0]
 					p0, hasP0 := prevSlots[0]
 
@@ -266,82 +372,94 @@ func main() {
 						dx := float64(s0.X - p0.X)
 						dy := float64(s0.Y - p0.Y)
 
-						// --- 3 FINGER GESTURES ---
 						if currentFingerCount == 3 && !gestureTriggered {
 							gestureAccX += dx
 							gestureAccY += dy
 
-							// Right (Alt+Shift+Tab - Previous App)
 							if gestureAccX > GestureDistThreshold {
-								triggerShortcut(vMouse, []uint16{evdev.KEY_LEFTALT, evdev.KEY_LEFTSHIFT, evdev.KEY_TAB})
+								vmouse.writeEvent(EV_KEY, KEY_LEFTALT, 1)
+								vmouse.writeEvent(EV_KEY, KEY_LEFTSHIFT, 1)
+								vmouse.writeEvent(EV_KEY, KEY_TAB, 1)
+								vmouse.syn()
+								time.Sleep(50 * time.Millisecond)
+								vmouse.writeEvent(EV_KEY, KEY_TAB, 0)
+								vmouse.writeEvent(EV_KEY, KEY_LEFTSHIFT, 0)
+								vmouse.writeEvent(EV_KEY, KEY_LEFTALT, 0)
+								vmouse.syn()
 								gestureTriggered = true
 							} else if gestureAccX < -GestureDistThreshold {
-								// Left (Alt+Tab - Next App)
-								triggerShortcut(vMouse, []uint16{evdev.KEY_LEFTALT, evdev.KEY_TAB})
+								vmouse.writeEvent(EV_KEY, KEY_LEFTALT, 1)
+								vmouse.writeEvent(EV_KEY, KEY_TAB, 1)
+								vmouse.syn()
+								time.Sleep(50 * time.Millisecond)
+								vmouse.writeEvent(EV_KEY, KEY_TAB, 0)
+								vmouse.writeEvent(EV_KEY, KEY_LEFTALT, 0)
+								vmouse.syn()
 								gestureTriggered = true
 							} else if gestureAccY < -GestureDistThreshold {
-								// Up (Super - Overview)
-								triggerShortcut(vMouse, []uint16{evdev.KEY_LEFTMETA})
+								vmouse.writeEvent(EV_KEY, KEY_LEFTMETA, 1)
+								vmouse.syn()
+								time.Sleep(50 * time.Millisecond)
+								vmouse.writeEvent(EV_KEY, KEY_LEFTMETA, 0)
+								vmouse.syn()
 								gestureTriggered = true
 							} else if gestureAccY > GestureDistThreshold {
-								// Down (Super+D - Desktop)
-								triggerShortcut(vMouse, []uint16{evdev.KEY_LEFTMETA, evdev.KEY_D})
+								vmouse.writeEvent(EV_KEY, KEY_LEFTMETA, 1)
+								vmouse.writeEvent(EV_KEY, KEY_D, 1)
+								vmouse.syn()
+								time.Sleep(50 * time.Millisecond)
+								vmouse.writeEvent(EV_KEY, KEY_D, 0)
+								vmouse.writeEvent(EV_KEY, KEY_LEFTMETA, 0)
+								vmouse.syn()
 								gestureTriggered = true
 							}
 
 						} else if currentFingerCount == 2 {
-							// --- 2 FINGER SCROLLING ---
 							isScrolling = true
 							scrollAccY += dy
 							scrollAccX += dx
-
-							dir := 1.0
-							if NaturalScrolling {
-								dir = 1.0
-							} else {
-								dir = -1.0
+							direction := 1
+							if !NaturalScrolling {
+								direction = -1
 							}
 
-							// Vertical
 							if math.Abs(scrollAccY) > ScrollDivider {
 								ticks := int(scrollAccY / ScrollDivider)
-								sendRel(vMouse, evdev.REL_WHEEL, int32(ticks*int(dir)))
-								scrollAccY -= float64(ticks * ScrollDivider)
+								vmouse.writeEvent(EV_REL, REL_WHEEL, int32(ticks*direction))
+								scrollAccY -= float64(ticks) * ScrollDivider
 								lastScrollTime = time.Now()
 							}
-
-							// Horizontal
 							if math.Abs(scrollAccX) > ScrollDivider {
 								ticks := int(scrollAccX / ScrollDivider)
-								// Invert X logic for natural feel
-								hDir := -dir
-								sendRel(vMouse, evdev.REL_HWHEEL, int32(ticks*int(hDir)))
-								scrollAccX -= float64(ticks * ScrollDivider)
+								vmouse.writeEvent(EV_REL, REL_HWHEEL, int32(ticks*-direction))
+								scrollAccX -= float64(ticks) * ScrollDivider
 								lastScrollTime = time.Now()
 							}
 
 						} else if currentFingerCount == 1 && !isScrolling && !gestureTriggered {
-							// --- 1 FINGER MOVEMENT ---
+							currP := s0.P
 							moveDist := math.Abs(dx) + math.Abs(dy)
 
-							if s0.P < MinMovePressure {
-								// Ignore
-							} else if s0.P < LowPressureThreshold && moveDist < SmallMoveCutoff {
-								// Ignore small jitters at low pressure
-							} else if math.Abs(dx) < 400 && math.Abs(dy) < 400 {
-								speed := moveDist
+							if currP >= MinMovePressure &&
+								!(currP < LowPressureThreshold && moveDist < SmallMoveCutoff) &&
+								math.Abs(dx) < 400 && math.Abs(dy) < 400 {
 								accel := 1.0
-								if speed > 15 {
+								if moveDist > 15 {
 									accel = AccelFactor
 								}
-								sendRel(vMouse, evdev.REL_X, int32(dx*MoveSensitivity*accel))
-								sendRel(vMouse, evdev.REL_Y, int32(dy*MoveSensitivity*accel))
+								mx := int32(dx * MoveSensitivity * accel)
+								my := int32(dy * MoveSensitivity * accel)
+								if mx != 0 || my != 0 {
+									vmouse.writeEvent(EV_REL, REL_X, mx)
+									vmouse.writeEvent(EV_REL, REL_Y, my)
+								}
 							}
 						}
 					}
-					vMouse.Sync()
 
-					// Update PrevSlots
+					vmouse.syn()
+
+					prevSlots = make(map[int]*Slot)
 					for k, v := range slots {
 						prevSlots[k] = &Slot{X: v.X, Y: v.Y, P: v.P}
 					}
@@ -349,73 +467,4 @@ func main() {
 			}
 		}
 	}
-}
-
-// --- HELPERS ---
-
-func findDevice(keyword string) (string, error) {
-	devices, _ := evdev.ListInputDevices()
-	for _, dev := range devices {
-		if strings.Contains(strings.ToLower(dev.Name), strings.ToLower(keyword)) {
-			return dev.Fn, nil
-		}
-	}
-	return "", fmt.Errorf("device with keyword '%s' not found", keyword)
-}
-
-func createUinput() (*evdev.UinputDevice, error) {
-	dev, err := evdev.CreateUinputDevice(&evdev.UinputUserDev{
-		Name: "Goodix-Gemini-Go-Driver",
-		ID:   evdev.InputId{Bus: 0x03, Vendor: 0x01, Product: 0x01, Version: 1},
-	})
-	if err != nil {
-		return nil, err
-	}
-
-	// Enable Capabilities
-	// Keys
-	keys := []uint16{
-		evdev.BTN_LEFT, evdev.BTN_RIGHT, evdev.BTN_MIDDLE,
-		evdev.KEY_LEFTALT, evdev.KEY_LEFTSHIFT, evdev.KEY_TAB,
-		evdev.KEY_LEFTMETA, evdev.KEY_D,
-	}
-	for _, k := range keys {
-		// Note: The library wrapper might handle capability setting internally 
-        // based on usage, but explicit enabling is safer if exposed. 
-        // For golang-evdev, creating the device usually sets defaults. 
-        // We assume standard mouse caps are active.
-        // *Correction*: golang-evdev's CreateUinputDevice is basic. 
-        // Ideally we use ioctl to set bits, but for brevity, we assume 
-        // the library defaults or OS accepts the events. 
-        // A robust solution executes ioctls here.
-	}
-    
-    // Note: Due to limitations in the basic `golang-evdev` CreateUinputDevice, 
-    // strictly setting capabilities (EV_KEY vs EV_REL) might require 
-    // a more verbose setup (using UI_SET_EVBIT ioctls). 
-    // However, many Linux kernels auto-detect capabilities based on the first events sent.
-    
-	return dev, nil
-}
-
-func sendKey(dev *evdev.UinputDevice, code uint16, val int32) {
-	dev.SendEvent(evdev.EV_KEY, code, val)
-}
-
-func sendRel(dev *evdev.UinputDevice, code uint16, val int32) {
-	dev.SendEvent(evdev.EV_REL, code, val)
-}
-
-func triggerShortcut(dev *evdev.UinputDevice, keys []uint16) {
-	// Press all
-	for _, k := range keys {
-		sendKey(dev, k, 1)
-	}
-	dev.Sync()
-	time.Sleep(50 * time.Millisecond)
-	// Release all
-	for i := len(keys) - 1; i >= 0; i-- {
-		sendKey(dev, keys[i], 0)
-	}
-	dev.Sync()
 }
